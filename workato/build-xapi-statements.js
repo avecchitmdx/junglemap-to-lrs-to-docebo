@@ -46,8 +46,13 @@ exports.main = ({ users, planId, planName }) => {
   // JungleMap returns .NET DateTime.MinValue, not null, for "never".
   const isSentinel = (t) => !t || String(t).startsWith('0001');
   // JungleMap timestamps carry no zone; assumed UTC (open question in the
-  // build guide). xAPI requires a zone, so append Z.
-  const toUtc = (t) => String(t) + 'Z';
+  // build guide). xAPI requires a zone, so append Z — but only if Workato's
+  // date_time_conversion hasn't already attached an offset (it re-serializes
+  // date_time-typed pills with the account timezone).
+  const toUtc = (t) => {
+    const s = String(t);
+    return /([zZ]|[+-]\d{2}:?\d{2})$/.test(s) ? s : s + 'Z';
+  };
 
   const VERBS = {
     completed: { id: 'http://adlnet.gov/expapi/verbs/completed', display: { 'en-US': 'completed' } },
