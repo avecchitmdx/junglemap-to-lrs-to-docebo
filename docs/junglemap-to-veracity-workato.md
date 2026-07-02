@@ -170,21 +170,123 @@ Field logic:
   list travels with the statement, no transformation needed.
 - **`duration`** — ISO-8601: `PT{SecondsUsed}S`.
 
-## Step 5 — Write to Veracity (batched)
+## Step 5 — Write to Veracity (batched, idempotent, test-store first)
 
-Collect the per-user statements into a list and POST the **array** to the LRS in
-batches (e.g. 50–100 per call), rather than one call per user.
+GetStatistics hands you ~1000 users in one blob. Three different things can
+"crash" here, and each has its own fix — don't conflate them:
 
-- Method: `POST`
-- URL: `<VERACITY_STORE>/statements`  *(fill in the actual store xAPI endpoint)*
-- Headers:
-  - `Authorization` = `Basic <base64(key:secret)>`  *(Veracity per-store key/secret)*
-  - `X-Experience-API-Version` = `1.0.3`  *(required by xAPI — easy to forget)*
-  - `Content-Type` = `application/json`
-- Body: the JSON array of statements.
+| Failure point | What actually breaks | Fix |
+|---|---|---|
+| Workato output preview | The browser tab, rendering a huge JSON tree | Never expand the full array in the UI; only preview single-batch outputs |
+| One giant POST to Veracity | Request rejected or timed out (body-size / request limits) | Batch 50 statements per POST (~20 calls for 1000 users) |
+| A re-run after a partial failure | Duplicate statements in the LRS | Deterministic statement `id` — replays become no-ops |
 
-**TODO (need from the LRS owner):** the Veracity store's xAPI endpoint URL and
-its Basic auth key/secret.
+### 5a. Get the store credentials
+
+From the Veracity store owner (goes into **Workato connection fields /
+secrets, not into a recipe body and not into this repo**):
+
+- the store's xAPI endpoint, shaped like
+  `https://<host>.lrs.io/xapi/` (each Veracity store has its own)
+- an **access key** (username + password pair) for that store, created in
+  Veracity under the store's *Access Keys*. Ask for a key with **write**
+  permission scoped to just this store.
+
+### 5b. Smoke-test the credentials with ONE statement
+
+Before wiring anything into the pipeline, prove the endpoint + key work with a
+single hand-written statement (from a terminal, or a throwaway Workato job):
+
+```bash
+curl -X POST 'https://<host>.lrs.io/xapi/statements' \
+  -u '<key>:<secret>' \
+  -H 'X-Experience-API-Version: 1.0.3' \
+  -H 'Content-Type: application/json' \
+  -d '[{
+    "id": "00000000-0000-4000-8000-000000000001",
+    "actor": { "objectType": "Agent", "mbox": "mailto:smoketest@example.com", "name": "smoketest" },
+    "verb": { "id": "http://adlnet.gov/expapi/verbs/completed", "display": { "en-US": "completed" } },
+    "object": { "objectType": "Activity", "id": "https://go.nanolearning.com/activityplans/smoketest" }
+  }]'
+```
+
+A `200` with a JSON array containing the statement id = good. `401` = key
+wrong; `403` = key lacks write on this store. The fixed `id` means you can run
+this as many times as you like — it stays one statement.
+
+### 5c. Use a test store for the first full run
+
+Veracity lets one account hold multiple stores, each with its own endpoint and
+keys. Create (or ask the owner for) a **scratch store** and point the recipe at
+it for the first end-to-end run. Verify the statements look right in Veracity's
+statement viewer, then switch the endpoint/key connection fields to the real
+store and run again. Because store choice lives in the connection, the recipe
+itself doesn't change — no risk of a half-edited recipe writing test data to
+prod.
+
+### 5d. Deterministic statement IDs (what makes retries safe)
+
+Give every statement an explicit `id`, derived from the data instead of
+random, e.g. a UUIDv5/hash of:
+
+```
+{DistributionUserId} | {ActivityPlanId} | {verb} | {LastCompletedActivity or ""}
+```
+
+In Workato formula mode this can be built with something like
+`Digest::MD5.hexdigest(...)` formatted into UUID shape
+(`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
+
+Why this matters: per the xAPI spec, POSTing a statement whose `id` the LRS has
+already seen (with identical content) is a **no-op**. So if batch 7 of 20 fails
+and the job retries from the top, batches 1–6 don't double-write. It also makes
+the daily schedule naturally incremental — an unchanged user re-generates the
+same id and is ignored; a user whose state changed (new `LastCompletedActivity`
+or new verb) produces a new id and a new statement.
+
+> One statement id with *different* content returns `409 Conflict` — if you see
+> 409s, the id recipe above isn't including every field that can change.
+
+### 5e. The batched write in Workato
+
+1. In the Step 4 **Repeat**, switch the repeat mode to **"Batch of items"**
+   with **batch size 50**. Each iteration now hands you a list of ≤50 users
+   instead of one.
+2. Inside the loop, build the statement array for the batch. Two workable
+   options:
+   - **Message-template / formula body:** set the HTTP request body to raw JSON
+     and construct the array with a formula over the batch list (map each user
+     to the Step 4 statement shape, then `.to_json`).
+   - **Lists by Workato:** accumulate per-user statements into a list variable,
+     then feed the list datapill into the request body.
+3. HTTP "Send request" per batch:
+   - Method: `POST`
+   - URL: `https://<host>.lrs.io/xapi/statements`
+   - Headers: `Authorization` = `Basic <key:secret>` (or the connection's basic
+     auth), `X-Experience-API-Version` = `1.0.3`, `Content-Type` = `application/json`
+   - Body: the JSON **array** of ≤50 statements.
+4. Wrap the POST in Workato's **error monitor** with **retry: 3, with delay**
+   so a transient 429/5xx retries that batch only. Thanks to 5d, even a
+   full-job re-run is safe.
+5. Success response is a JSON array of the accepted statement ids — log
+   `batch index` + `count` per iteration (small, safe to preview) rather than
+   the statement bodies.
+
+Sequential batches of 50 also act as a natural throttle — Workato runs loop
+iterations one at a time, so Veracity never sees more than one in-flight
+request from this recipe.
+
+### 5f. First-run checklist
+
+- [ ] 5b smoke test passes against the **test** store
+- [ ] Recipe run against test store with the Step 3 body pointed at the real
+      plan — all ~20 batches return 200
+- [ ] Spot-check a handful of users in Veracity's viewer: verb roll-up right,
+      `ActivityStatistics` extension intact, duration sane
+- [ ] Re-run the whole job against the test store — statement count in the
+      store must **not** grow (proves 5d idempotency)
+- [ ] Flip connection to prod store, run once, spot-check again
+- [ ] Only then enable the daily schedule
 
 ## Phase 2 — Overdue notifications (Docebo / Workato)
 
