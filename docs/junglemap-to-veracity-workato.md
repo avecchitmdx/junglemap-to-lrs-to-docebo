@@ -273,9 +273,9 @@ drop changes every user's `ActivityStatistics` extension, so the statement
 content changes even for idle users — the id has to change with it or the LRS
 answers 409.
 
-In Workato formula mode this can be built with something like
-`Digest::MD5.hexdigest(...)` formatted into UUID shape
-(`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
+Implemented in [`workato/build-xapi-statements.js`](../workato/build-xapi-statements.js)
+(FNV-1a hash formatted as an RFC-4122-shaped UUID), which also does the whole
+per-user statement mapping — see 5e.
 
 Why this matters: per the xAPI spec, POSTing a statement whose `id` the LRS has
 already seen (with identical content) is a **no-op**. So if batch 7 of 20 fails
@@ -289,28 +289,36 @@ or new verb) produces a new id and a new statement.
 
 ### 5e. The batched write in Workato
 
-1. In the Step 4 **Repeat**, switch the repeat mode to **"Batch of items"**
-   with **batch size 50**. Each iteration now hands you a list of ≤50 users
-   instead of one.
-2. Inside the loop, build the statement array for the batch. Two workable
-   options:
-   - **Message-template / formula body:** set the HTTP request body to raw JSON
-     and construct the array with a formula over the batch list (map each user
-     to the Step 4 statement shape, then `.to_json`).
-   - **Lists by Workato:** accumulate per-user statements into a list variable,
-     then feed the list datapill into the request body.
-3. HTTP "Send request" per batch:
+Connection note: the recipe uses a **secondary HTTP connection** for Veracity
+(Basic auth — access key as username, secret as password), alongside the
+auth-None JungleMap connection. Verified working 2026-07-01. If the LRS
+answers `401 {"message":"invalid login"}`, the key/secret are swapped or the
+connection isn't Basic.
+
+1. Inside the plan loop after GetStatistics, add a **Repeat** over the user
+   array in **"Batch of items"** mode, **batch size 50**. Each iteration hands
+   you a list of ≤50 users instead of one.
+2. Inside the loop, a **JavaScript by Workato** action builds the statement
+   array — full code in
+   [`workato/build-xapi-statements.js`](../workato/build-xapi-statements.js).
+   Inputs: `users` (the batch datapill), `planId`, `planName` (from the plan
+   loop). Outputs: `body` (JSON string, the statement array) and `count`.
+   This one action does the verb roll-up, sentinel-date guard, no-email actor
+   fallback, deterministic ids (5d), and the extensions passthrough.
+3. HTTP "Send request" per batch (Veracity connection):
    - Method: `POST`
    - URL: `https://transmedics.enterprise.lrs.io/junglemap/xapi/statements`
-   - Headers: `Authorization` = `Basic <key:secret>` (or the connection's basic
-     auth), `X-Experience-API-Version` = `1.0.3`, `Content-Type` = `application/json`
-   - Body: the JSON **array** of ≤50 statements.
+   - Headers: `X-Experience-API-Version` = `1.0.3`, `Content-Type` =
+     `application/json` (Authorization comes from the connection's Basic auth)
+   - Body (raw): the `body` datapill from the JavaScript action
+   - **Wait for response: Yes** (off = fire-and-forget, no status code, no
+     retries), response timeout ~120 s.
 4. Wrap the POST in Workato's **error monitor** with **retry: 3, with delay**
    so a transient 429/5xx retries that batch only. Thanks to 5d, even a
    full-job re-run is safe.
 5. Success response is a JSON array of the accepted statement ids — log
-   `batch index` + `count` per iteration (small, safe to preview) rather than
-   the statement bodies.
+   `batch index` + the JS action's `count` per iteration (small, safe to
+   preview) rather than the statement bodies.
 
 Sequential batches of 50 also act as a natural throttle — Workato runs loop
 iterations one at a time, so Veracity never sees more than one in-flight
@@ -318,15 +326,19 @@ request from this recipe.
 
 ### 5f. First-run checklist
 
-- [ ] 5b smoke test passes against the **test** store
-- [ ] Recipe run against test store with the Step 3 body pointed at the real
-      plan — all ~20 batches return 200
-- [ ] Spot-check a handful of users in Veracity's viewer: verb roll-up right,
-      `ActivityStatistics` extension intact, duration sane
-- [ ] Re-run the whole job against the test store — statement count in the
-      store must **not** grow (proves 5d idempotency)
-- [ ] Flip connection to prod store, run once, spot-check again
-- [ ] Only then enable the daily schedule
+- [x] 5b smoke test passes (2026-07-01 — 200 from the `junglemap` store via
+      the secondary Basic-auth connection)
+- [ ] **Limited trial first** (no scratch store exists, so trial in place):
+      temporarily add `users = users.slice(0, 5);` as the first line of the
+      JavaScript action's `main`, run once, spot-check those 5 users in
+      Veracity's viewer: verb roll-up right, `ActivityStatistics` extension
+      intact, ids stable
+- [ ] Remove the slice, full run — all ~20 batches return 200
+- [ ] Re-run the whole job — statement count in the store must **not** grow
+      (proves 5d idempotency)
+- [ ] Switch the trigger from every-5-minutes to **daily** (idempotency makes
+      frequent runs harmless, but they burn tasks)
+- [ ] Only then leave the recipe running on schedule
 
 ## Phase 2 — Overdue notifications (Docebo / Workato)
 
