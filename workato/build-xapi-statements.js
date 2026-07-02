@@ -1,11 +1,13 @@
 // JavaScript by Workato action — builds xAPI statements for a batch of
 // GetStatistics users, ready to POST to Veracity as a single array.
 //
-// Model: one statement per module the user has actually touched
-// (completed -> "completed", started-not-finished -> "attempted"), plus one
-// course-level "completed" statement when JungleMap says the whole course is
-// done. Untouched modules produce nothing. Module statements point at their
-// course via context.contextActivities.parent, so per-course rollups work.
+// Model: per released module, a statement for each lifecycle event that has
+// happened — "assigned" (module released to the user, at
+// DistributionActivityStarted), "attempted" (user started it), "completed"
+// (user finished it) — plus one course-level "completed" statement when
+// JungleMap says the whole course is done. Module statements point at their
+// course via context.contextActivities.parent, so per-course rollups work,
+// and assigned-without-completed is the queryable "overdue" signal.
 //
 // Statement ids are deterministic (hash of the fields that define the event),
 // so a statement for an event the LRS has already stored is a no-op on
@@ -48,8 +50,9 @@ exports.main = ({ users, planId, planName }) => {
   const toUtc = (t) => String(t) + 'Z';
 
   const VERBS = {
-    completed:  { id: 'http://adlnet.gov/expapi/verbs/completed',  display: { 'en-US': 'completed' } },
-    attempted:  { id: 'http://adlnet.gov/expapi/verbs/attempted',  display: { 'en-US': 'attempted' } },
+    completed: { id: 'http://adlnet.gov/expapi/verbs/completed', display: { 'en-US': 'completed' } },
+    attempted: { id: 'http://adlnet.gov/expapi/verbs/attempted', display: { 'en-US': 'attempted' } },
+    assigned:  { id: 'https://w3id.org/xapi/dod-isd/verbs/assigned', display: { 'en-US': 'assigned' } },
   };
 
   const courseIri = 'https://go.nanolearning.com/activityplans/' + planId;
@@ -70,35 +73,38 @@ exports.main = ({ users, planId, planName }) => {
           name: 'JungleMap user ' + u.DistributionUserId,
         };
 
-    // One statement per touched module.
+    // One statement per lifecycle event per released module.
     for (const act of u.ActivityStatistics || []) {
-      let verb, when;
+      const events = [];
+      if (!isSentinel(act.DistributionActivityStarted)) {
+        events.push({ verb: VERBS.assigned, when: act.DistributionActivityStarted });
+      }
+      if (act.HasStarted && !isSentinel(act.Started)) {
+        events.push({ verb: VERBS.attempted, when: act.Started });
+      }
       if (act.HasCompleted && !isSentinel(act.Completed)) {
-        verb = VERBS.completed;
-        when = act.Completed;
-      } else if (act.HasStarted && !isSentinel(act.Started)) {
-        verb = VERBS.attempted;
-        when = act.Started;
-      } else {
-        continue; // released but untouched — no event, no statement
+        events.push({ verb: VERBS.completed, when: act.Completed });
       }
 
-      statements.push({
-        id: uuidFrom([u.DistributionUserId, act.ActivityId, verb.id, when].join('|')),
-        actor,
-        verb,
-        timestamp: toUtc(when),
-        object: {
-          objectType: 'Activity',
-          id: 'https://go.nanolearning.com/activities/' + act.ActivityId,
-          definition: {
-            name: { 'en-US': act.Title },
-            type: 'http://adlnet.gov/expapi/activities/module',
+      for (const { verb, when } of events) {
+        const stmt = {
+          id: uuidFrom([u.DistributionUserId, act.ActivityId, verb.id, when].join('|')),
+          actor,
+          verb,
+          timestamp: toUtc(when),
+          object: {
+            objectType: 'Activity',
+            id: 'https://go.nanolearning.com/activities/' + act.ActivityId,
+            definition: {
+              name: { 'en-US': act.Title },
+              type: 'http://adlnet.gov/expapi/activities/module',
+            },
           },
-        },
-        result: { completion: verb === VERBS.completed },
-        context: courseContext,
-      });
+          context: courseContext,
+        };
+        if (verb === VERBS.completed) stmt.result = { completion: true };
+        statements.push(stmt);
+      }
     }
 
     // Course-level completion, only when JungleMap says the whole course is

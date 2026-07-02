@@ -169,22 +169,31 @@ Semantics (confirmed against production data, 2026-07):
 > per-module model below is queryable, needs no snapshot churn, and its
 > idempotency is simpler.
 
-For each user in the batch, emit:
+For each user in the batch, emit **one statement per lifecycle event per
+released module** — each event appears once its date is real:
 
-- **One statement per module the user has touched:**
-  - `HasCompleted` (real `Completed` date) → verb `completed`
-  - else `HasStarted` (real `Started` date) → verb `attempted`
-  - released but untouched → **no statement** (so new monthly releases write
-    nothing until someone acts)
-  - `object` = `https://go.nanolearning.com/activities/{ActivityId}` (type
-    `module`), named from `Title`
-  - `timestamp` = the module's own `Started`/`Completed` time (assumed UTC —
-    open question — with `Z` appended, since xAPI requires a zone)
-  - `context.contextActivities.parent` = the course activity, so per-course
-    rollups group the modules
-- **One course-level statement when `CourseCompletionStatus == "Completed"`:**
-  verb `completed`, `object` = `https://go.nanolearning.com/activityplans/{planId}`
-  (type `course`), timestamped from `LastCompletedActivity`.
+| Module state | Statements (verb @ timestamp) |
+|---|---|
+| released, untouched | `assigned` @ `DistributionActivityStarted` |
+| started | + `attempted` @ `Started` |
+| completed | + `completed` @ `Completed` |
+
+- `assigned` uses `https://w3id.org/xapi/dod-isd/verbs/assigned` (xAPI has no
+  core verb for it). It's what makes the LRS self-sufficient for overdue
+  queries: *assigned but not completed* = overdue, no JungleMap roster lookup
+  needed. It also provides the denominator for completion-rate reporting.
+- `object` = `https://go.nanolearning.com/activities/{ActivityId}` (type
+  `module`), named from `Title`; timestamps are the module's own dates
+  (assumed UTC — open question — with `Z` appended, since xAPI requires a
+  zone); `context.contextActivities.parent` = the course activity, so
+  per-course rollups group the modules.
+- A fully-completed module therefore always shows its full
+  assigned → attempted → completed trail, regardless of how the daily polls
+  landed relative to the user's activity.
+
+Plus **one course-level statement when `CourseCompletionStatus == "Completed"`:**
+verb `completed`, `object` = `https://go.nanolearning.com/activityplans/{planId}`
+(type `course`), timestamped from `LastCompletedActivity`.
 
 All of this is implemented in
 [`workato/build-xapi-statements.js`](../workato/build-xapi-statements.js) —
@@ -193,22 +202,25 @@ for users without an email.
 
 ### How the lifecycle lands in the LRS
 
-The recipe polls state daily; deterministic ids turn that into an event log:
+The recipe polls state daily; deterministic ids turn that into an event log.
+Every run regenerates all statements for already-recorded events — same ids,
+same content — and the LRS ignores them; only genuinely new events land.
 
-1. *User starts module 7* → next run emits `attempted module-7` (timestamped
-   with the real start time). Every later run regenerates the identical
-   statement — same id, same content — which the LRS ignores. One event, once.
-2. *User finishes module 7* → next run adds `completed module-7`. The earlier
-   `attempted` stays — that's the history, not a duplicate.
-3. *User finishes the last released module* → JungleMap flips
-   `CourseCompletionStatus` → the same run emits `completed course`.
-4. *JungleMap releases module 10* → nothing is written for anyone until they
-   act. (If the release flips completed users back to `Pending`, their course
-   completion simply recurs later with a new date — a true second completion.)
+1. *JungleMap releases module 10* → next run emits ~1000 `assigned module-10`
+   statements (one per user, timestamped with the release). One-time wave,
+   then silence until users act.
+2. *User starts module 10* → next run adds `attempted module-10` at the real
+   start time.
+3. *User finishes it* → next run adds `completed module-10`. The `assigned`
+   and `attempted` stay — that's the history, not duplication.
+4. *User finishes the last released module* → JungleMap flips
+   `CourseCompletionStatus` → the same run emits `completed course`. (If a
+   later release flips them back to `Pending`, their course completion simply
+   recurs later with a new date — a true second completion.)
 
-Phase-2 overdue check becomes a standard LRS query — e.g. "actors with no
-`completed` statement for activity `…/activities/{newest module id}`" — no
-JSON parsing required.
+Phase-2 overdue check becomes a standard LRS query — actors with `assigned`
+but no `completed` for module X — answerable entirely from Veracity, no
+JungleMap roster lookup or JSON parsing required.
 
 ## Step 5 — Write to Veracity (batched, idempotent, test-store first)
 
