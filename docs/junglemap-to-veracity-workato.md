@@ -105,24 +105,55 @@ HTTP "Send request":
 > Robustness: wrap Steps 3+ in a **Repeat** over the Step 2 plan list and map
 > `ActivityPlanId` to each plan's `Id`, so new plans are picked up automatically.
 
-Returns an array where **each element is a user**:
+Returns an array where **each element is a user**. Real 2025 production shape
+(differs from NanoLearning's older documented example):
 
 ```json
 {
-  "DistributionUserId": 364343,
-  "Email": "user@example.com",
-  "StartedCount": 1,
-  "CompletedCount": 1,
-  "SecondsUsed": 232,
-  "ActivityCount": 1,
+  "DistributionUserId": 39498884,
+  "Email": "user@transmedics.com",
+  "ExternalId": "1364fc2d-0093-494d-99d4-5af9c086d544",
+  "DistributionName": "Security Awareness Training",
+  "StartedActivities": 9,
+  "StartedCount": 0,
+  "CompletedCount": 0,
+  "CourseCompletionStatus": "Pending",
+  "StarPointsScore1to5": 1,
   "ActivityStatistics": [
-    { "Title": "Become a STAR in information security", "HasStarted": true,
-      "HasCompleted": true, "ActivityId": 4675859, "Type": "Nano",
-      "Started": "2020-01-15T18:33:27.367", "Completed": "2020-01-15T18:33:51.297" }
+    {
+      "Title": "Email security and ransomware",
+      "HasStarted": false,
+      "HasCompleted": false,
+      "ActivityId": 4675866,
+      "Type": "Nano",
+      "Started": "0001-01-01T00:00:00",
+      "Completed": "0001-01-01T00:00:00",
+      "DistributionActivityStarted": "2026-03-10T13:30:57.763",
+      "PersonalInformationHidden": false
+    }
   ],
-  "FirstStartedActivity": "…", "LastCompletedActivity": "…"
+  "ActivityCount": 16,
+  "FirstStartedActivity": "0001-01-01T00:00:00.000000+00:49",
+  "LastCompletedActivity": "0001-01-01T00:00:00.000000+00:49"
 }
 ```
+
+Semantics (confirmed against production data, 2026-07):
+
+- **`CourseCompletionStatus`** is the authoritative roll-up (`Pending`,
+  presumably `Completed`) — use it for the verb instead of comparing counts.
+- **Sentinel dates, not nulls:** "never started/completed" comes back as
+  .NET DateTime.MinValue — `0001-01-01T00:00:00`. Guard every date formula
+  with *starts-with-`0001` ⇒ treat as absent*.
+- **This is a drip campaign.** `ActivityStatistics` contains only activities
+  whose *distribution has begun* (`DistributionActivityStarted` runs monthly,
+  Nov 2025 → …). `StartedActivities` counts released activities, **not** user
+  starts. So the array grows over the campaign; don't assume its length equals
+  `ActivityCount` (16 — the plan's 17 minus the admin-only Readme).
+- **`StartedCount`/`CompletedCount`** are the user's own starts/completions
+  (per-user roll-ups of `HasStarted`/`HasCompleted`).
+- **No `SecondsUsed` in the 2025 response** — the statement carries no
+  `result.duration`.
 
 > ⚠️ With `IncludeActivityStatistics: true` this response is large (every user ×
 > every activity). It will crash the browser if you try to expand it in Workato's
@@ -149,7 +180,6 @@ detail rides inside `result.extensions` as the user's `ActivityStatistics` array
   },
   "result": {
     "completion": true,
-    "duration": "PT{SecondsUsed}S",
     "extensions": {
       "https://go.nanolearning.com/xapi/extensions/activities": "{ActivityStatistics array}"
     }
@@ -157,18 +187,22 @@ detail rides inside `result.extensions` as the user's `ActivityStatistics` array
 }
 ```
 
-Field logic:
+Field logic (updated for the 2025 response shape):
 
-- **`verb` / `result.completion`** — treat the user as having completed the
-  training when `CompletedCount == ActivityCount`. Otherwise use verb
-  `http://adlnet.gov/expapi/verbs/attempted` (if they started anything) or
-  `http://adlnet.gov/expapi/verbs/registered` (if they haven't started), with
-  `result.completion: false`. The per-course truth is preserved in the extension
-  either way, so the top-level flag is just a roll-up.
+- **`verb` / `result.completion`** — drive both off `CourseCompletionStatus`:
+  - `Completed` → verb `completed`, `result.completion: true`
+  - anything else with `StartedCount > 0` → verb `attempted`, `completion: false`
+  - otherwise → verb `registered`, `completion: false`
+
+  (`ActivityStatistics` being non-empty is **not** evidence of a start — in a
+  drip campaign every user carries entries for released activities.)
+- **Never use a year-0001 timestamp in a statement.** If
+  `FirstStartedActivity`/`LastCompletedActivity` starts with `0001`, omit the
+  field it would have fed.
 - **`result.extensions`** — drop the whole `ActivityStatistics` array in. xAPI
-  extensions accept arbitrary JSON, so the per-course `HasStarted`/`HasCompleted`
-  list travels with the statement, no transformation needed.
-- **`duration`** — ISO-8601: `PT{SecondsUsed}S`.
+  extensions accept arbitrary JSON, so the per-activity detail travels with the
+  statement, no transformation needed.
+- **No `duration`** — the 2025 response has no `SecondsUsed` field.
 
 ## Step 5 — Write to Veracity (batched, idempotent, test-store first)
 
@@ -231,8 +265,13 @@ Give every statement an explicit `id`, derived from the data instead of
 random, e.g. a UUIDv5/hash of:
 
 ```
-{DistributionUserId} | {ActivityPlanId} | {verb} | {LastCompletedActivity or ""}
+{DistributionUserId} | {ActivityPlanId} | {verb} | {StartedActivities} | {StartedCount} | {CompletedCount} | {LastCompletedActivity or ""}
 ```
+
+`StartedActivities` (released-activity count) must be in the hash: each monthly
+drop changes every user's `ActivityStatistics` extension, so the statement
+content changes even for idle users — the id has to change with it or the LRS
+answers 409.
 
 In Workato formula mode this can be built with something like
 `Digest::MD5.hexdigest(...)` formatted into UUID shape
