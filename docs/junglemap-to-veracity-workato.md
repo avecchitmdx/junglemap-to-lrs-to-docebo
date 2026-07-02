@@ -186,11 +186,12 @@ GetStatistics hands you ~1000 users in one blob. Three different things can
 From the Veracity store owner (goes into **Workato connection fields /
 secrets, not into a recipe body and not into this repo**):
 
-- the store's xAPI endpoint, shaped like
-  `https://<host>.lrs.io/xapi/` (each Veracity store has its own)
+- the store's xAPI endpoint — for this project:
+  `https://transmedics.enterprise.lrs.io/junglemap/xapi/`
 - an **access key** (username + password pair) for that store, created in
   Veracity under the store's *Access Keys*. Ask for a key with **write**
-  permission scoped to just this store.
+  permission scoped to just this store. Referenced below as
+  `VERACITY_KEY` / `VERACITY_SECRET`.
 
 ### 5b. Smoke-test the credentials with ONE statement
 
@@ -198,8 +199,8 @@ Before wiring anything into the pipeline, prove the endpoint + key work with a
 single hand-written statement (from a terminal, or a throwaway Workato job):
 
 ```bash
-curl -X POST 'https://<host>.lrs.io/xapi/statements' \
-  -u '<key>:<secret>' \
+curl -X POST 'https://transmedics.enterprise.lrs.io/junglemap/xapi/statements' \
+  -u "$VERACITY_KEY:$VERACITY_SECRET" \
   -H 'X-Experience-API-Version: 1.0.3' \
   -H 'Content-Type: application/json' \
   -d '[{
@@ -261,7 +262,7 @@ or new verb) produces a new id and a new statement.
      then feed the list datapill into the request body.
 3. HTTP "Send request" per batch:
    - Method: `POST`
-   - URL: `https://<host>.lrs.io/xapi/statements`
+   - URL: `https://transmedics.enterprise.lrs.io/junglemap/xapi/statements`
    - Headers: `Authorization` = `Basic <key:secret>` (or the connection's basic
      auth), `X-Experience-API-Version` = `1.0.3`, `Content-Type` = `application/json`
    - Body: the JSON **array** of ≤50 statements.
