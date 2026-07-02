@@ -1,5 +1,15 @@
-// JavaScript by Workato action — builds one xAPI statement per user for a
-// batch of GetStatistics users, ready to POST to Veracity as a single array.
+// JavaScript by Workato action — builds xAPI statements for a batch of
+// GetStatistics users, ready to POST to Veracity as a single array.
+//
+// Model: one statement per module the user has actually touched
+// (completed -> "completed", started-not-finished -> "attempted"), plus one
+// course-level "completed" statement when JungleMap says the whole course is
+// done. Untouched modules produce nothing. Module statements point at their
+// course via context.contextActivities.parent, so per-course rollups work.
+//
+// Statement ids are deterministic (hash of the fields that define the event),
+// so a statement for an event the LRS has already stored is a no-op on
+// re-POST. The daily schedule therefore only ever adds *new* events.
 //
 // Input schema (define on the action):
 //   users    : list   (map the batch datapill from the "Batch of items" repeat)
@@ -10,9 +20,6 @@
 //   count : integer (statements in this batch — cheap to log per iteration)
 
 exports.main = ({ users, planId, planName }) => {
-  // FNV-1a over the id key, four passes with different salts, formatted as an
-  // RFC-4122-shaped UUID. Deterministic: same user-state => same statement id,
-  // which is what makes re-runs and retries no-ops in the LRS.
   const fnv1a = (str, seed) => {
     let h = seed >>> 0;
     for (let i = 0; i < str.length; i++) {
@@ -24,9 +31,9 @@ exports.main = ({ users, planId, planName }) => {
   const hex8 = (n) => n.toString(16).padStart(8, '0');
   const uuidFrom = (s) => {
     const a = hex8(fnv1a(s, 0x811c9dc5));
-    const b = hex8(fnv1a('' + s, 0x811c9dc5));
-    const c = hex8(fnv1a(s + '', 0x01000193));
-    const d = hex8(fnv1a('' + s + '', 0x01000193));
+    const b = hex8(fnv1a('salt1|' + s, 0x811c9dc5));
+    const c = hex8(fnv1a(s + '|salt2', 0x01000193));
+    const d = hex8(fnv1a('salt3|' + s + '|salt3', 0x01000193));
     const variant = ((parseInt(c[3], 16) & 0x3) | 0x8).toString(16);
     return (
       a + '-' + b.slice(0, 4) + '-4' + b.slice(4, 7) + '-' +
@@ -36,27 +43,25 @@ exports.main = ({ users, planId, planName }) => {
 
   // JungleMap returns .NET DateTime.MinValue, not null, for "never".
   const isSentinel = (t) => !t || String(t).startsWith('0001');
+  // JungleMap timestamps carry no zone; assumed UTC (open question in the
+  // build guide). xAPI requires a zone, so append Z.
+  const toUtc = (t) => String(t) + 'Z';
 
   const VERBS = {
     completed:  { id: 'http://adlnet.gov/expapi/verbs/completed',  display: { 'en-US': 'completed' } },
     attempted:  { id: 'http://adlnet.gov/expapi/verbs/attempted',  display: { 'en-US': 'attempted' } },
-    registered: { id: 'http://adlnet.gov/expapi/verbs/registered', display: { 'en-US': 'registered' } },
   };
 
-  const statements = users.map((u) => {
-    const completed = u.CourseCompletionStatus === 'Completed';
-    const verb = completed ? VERBS.completed
-      : (u.StartedCount > 0 ? VERBS.attempted : VERBS.registered);
+  const courseIri = 'https://go.nanolearning.com/activityplans/' + planId;
+  const courseContext = {
+    contextActivities: {
+      parent: [{ objectType: 'Activity', id: courseIri }],
+    },
+  };
 
-    // StartedActivities (count of *released* modules) must be in the key: a
-    // monthly release changes every user's ActivityStatistics extension, so
-    // the statement content changes and the id has to change with it.
-    const idKey = [
-      u.DistributionUserId, planId, verb.id,
-      u.StartedActivities, u.StartedCount, u.CompletedCount,
-      isSentinel(u.LastCompletedActivity) ? '' : u.LastCompletedActivity,
-    ].join('|');
+  const statements = [];
 
+  for (const u of users) {
     const actor = u.Email
       ? { objectType: 'Agent', mbox: 'mailto:' + u.Email, name: u.Email }
       : {
@@ -65,26 +70,61 @@ exports.main = ({ users, planId, planName }) => {
           name: 'JungleMap user ' + u.DistributionUserId,
         };
 
-    return {
-      id: uuidFrom(idKey),
-      actor,
-      verb,
-      object: {
-        objectType: 'Activity',
-        id: 'https://go.nanolearning.com/activityplans/' + planId,
-        definition: {
-          name: { 'en-US': planName },
-          type: 'http://adlnet.gov/expapi/activities/course',
+    // One statement per touched module.
+    for (const act of u.ActivityStatistics || []) {
+      let verb, when;
+      if (act.HasCompleted && !isSentinel(act.Completed)) {
+        verb = VERBS.completed;
+        when = act.Completed;
+      } else if (act.HasStarted && !isSentinel(act.Started)) {
+        verb = VERBS.attempted;
+        when = act.Started;
+      } else {
+        continue; // released but untouched — no event, no statement
+      }
+
+      statements.push({
+        id: uuidFrom([u.DistributionUserId, act.ActivityId, verb.id, when].join('|')),
+        actor,
+        verb,
+        timestamp: toUtc(when),
+        object: {
+          objectType: 'Activity',
+          id: 'https://go.nanolearning.com/activities/' + act.ActivityId,
+          definition: {
+            name: { 'en-US': act.Title },
+            type: 'http://adlnet.gov/expapi/activities/module',
+          },
         },
-      },
-      result: {
-        completion: completed,
-        extensions: {
-          'https://go.nanolearning.com/xapi/extensions/activities': u.ActivityStatistics || [],
+        result: { completion: verb === VERBS.completed },
+        context: courseContext,
+      });
+    }
+
+    // Course-level completion, only when JungleMap says the whole course is
+    // done. If a later module release flips the user back to Pending and they
+    // finish again, LastCompletedActivity moves -> new id -> a second course
+    // completion is recorded, which is the true history.
+    if (u.CourseCompletionStatus === 'Completed') {
+      const when = isSentinel(u.LastCompletedActivity) ? '' : u.LastCompletedActivity;
+      const stmt = {
+        id: uuidFrom([u.DistributionUserId, planId, 'course-completed', when].join('|')),
+        actor,
+        verb: VERBS.completed,
+        object: {
+          objectType: 'Activity',
+          id: courseIri,
+          definition: {
+            name: { 'en-US': planName },
+            type: 'http://adlnet.gov/expapi/activities/course',
+          },
         },
-      },
-    };
-  });
+        result: { completion: true },
+      };
+      if (when) stmt.timestamp = toUtc(when);
+      statements.push(stmt);
+    }
+  }
 
   return { body: JSON.stringify(statements), count: statements.length };
 };

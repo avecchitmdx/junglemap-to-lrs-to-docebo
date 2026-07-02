@@ -160,49 +160,55 @@ Semantics (confirmed against production data, 2026-07):
 > output preview — that's the UI rendering, not the recipe. Don't open the full
 > blob; pipe the array straight into a Repeat and process per user.
 
-## Step 4 — One xAPI statement per user
+## Step 4 — Statement model: one per module event, plus a course completion
 
-Add a **Repeat over the user array** (one level — do *not* split activities into
-separate statements). For each user, emit a single statement; the per-course
-detail rides inside `result.extensions` as the user's `ActivityStatistics` array.
+> Earlier drafts used one compiled statement per user with the whole
+> `ActivityStatistics` array in `result.extensions`. Rejected: xAPI queries and
+> Veracity dashboards can't see into extensions, and every monthly module
+> release forced a fresh snapshot statement for all ~1000 users. The
+> per-module model below is queryable, needs no snapshot churn, and its
+> idempotency is simpler.
 
-```json
-{
-  "actor":  { "objectType": "Agent", "mbox": "mailto:{Email}", "name": "{Email}" },
-  "verb":   { "id": "http://adlnet.gov/expapi/verbs/completed", "display": { "en-US": "completed" } },
-  "object": {
-    "objectType": "Activity",
-    "id": "https://go.nanolearning.com/activityplans/146291",
-    "definition": {
-      "name": { "en-US": "Information security awareness 2025 (ENG)" },
-      "type": "http://adlnet.gov/expapi/activities/course"
-    }
-  },
-  "result": {
-    "completion": true,
-    "extensions": {
-      "https://go.nanolearning.com/xapi/extensions/activities": "{ActivityStatistics array}"
-    }
-  }
-}
-```
+For each user in the batch, emit:
 
-Field logic (updated for the 2025 response shape):
+- **One statement per module the user has touched:**
+  - `HasCompleted` (real `Completed` date) → verb `completed`
+  - else `HasStarted` (real `Started` date) → verb `attempted`
+  - released but untouched → **no statement** (so new monthly releases write
+    nothing until someone acts)
+  - `object` = `https://go.nanolearning.com/activities/{ActivityId}` (type
+    `module`), named from `Title`
+  - `timestamp` = the module's own `Started`/`Completed` time (assumed UTC —
+    open question — with `Z` appended, since xAPI requires a zone)
+  - `context.contextActivities.parent` = the course activity, so per-course
+    rollups group the modules
+- **One course-level statement when `CourseCompletionStatus == "Completed"`:**
+  verb `completed`, `object` = `https://go.nanolearning.com/activityplans/{planId}`
+  (type `course`), timestamped from `LastCompletedActivity`.
 
-- **`verb` / `result.completion`** — drive both off `CourseCompletionStatus`:
-  - `Completed` → verb `completed`, `result.completion: true`
-  - anything else with `StartedCount > 0` → verb `attempted`, `completion: false`
-  - otherwise → verb `registered`, `completion: false`
+All of this is implemented in
+[`workato/build-xapi-statements.js`](../workato/build-xapi-statements.js) —
+including the year-0001 sentinel guard and an `account`-based actor fallback
+for users without an email.
 
-  (`ActivityStatistics` being non-empty is **not** evidence of a start — in a
-  drip campaign every user carries entries for released activities.)
-- **Never use a year-0001 timestamp in a statement.** If
-  `FirstStartedActivity`/`LastCompletedActivity` starts with `0001`, omit the
-  field it would have fed.
-- **`result.extensions`** — drop the whole `ActivityStatistics` array in. xAPI
-  extensions accept arbitrary JSON, so the per-activity detail travels with the
-  statement, no transformation needed.
-- **No `duration`** — the 2025 response has no `SecondsUsed` field.
+### How the lifecycle lands in the LRS
+
+The recipe polls state daily; deterministic ids turn that into an event log:
+
+1. *User starts module 7* → next run emits `attempted module-7` (timestamped
+   with the real start time). Every later run regenerates the identical
+   statement — same id, same content — which the LRS ignores. One event, once.
+2. *User finishes module 7* → next run adds `completed module-7`. The earlier
+   `attempted` stays — that's the history, not a duplicate.
+3. *User finishes the last released module* → JungleMap flips
+   `CourseCompletionStatus` → the same run emits `completed course`.
+4. *JungleMap releases module 10* → nothing is written for anyone until they
+   act. (If the release flips completed users back to `Pending`, their course
+   completion simply recurs later with a new date — a true second completion.)
+
+Phase-2 overdue check becomes a standard LRS query — e.g. "actors with no
+`completed` statement for activity `…/activities/{newest module id}`" — no
+JSON parsing required.
 
 ## Step 5 — Write to Veracity (batched, idempotent, test-store first)
 
@@ -261,28 +267,24 @@ prod.
 
 ### 5d. Deterministic statement IDs (what makes retries safe)
 
-Give every statement an explicit `id`, derived from the data instead of
-random, e.g. a UUIDv5/hash of:
+Give every statement an explicit `id`, derived from the event instead of
+random:
 
 ```
-{DistributionUserId} | {ActivityPlanId} | {verb} | {StartedActivities} | {StartedCount} | {CompletedCount} | {LastCompletedActivity or ""}
+module event:      {DistributionUserId} | {ActivityId} | {verb} | {event timestamp}
+course completion: {DistributionUserId} | {planId} | course-completed | {LastCompletedActivity}
 ```
 
-`StartedActivities` (released-activity count) must be in the hash: each monthly
-drop changes every user's `ActivityStatistics` extension, so the statement
-content changes even for idle users — the id has to change with it or the LRS
-answers 409.
-
-Implemented in [`workato/build-xapi-statements.js`](../workato/build-xapi-statements.js)
-(FNV-1a hash formatted as an RFC-4122-shaped UUID), which also does the whole
-per-user statement mapping — see 5e.
+A module event is immutable — once completed, its statement never changes — so
+the id never needs to change either. Implemented in
+[`workato/build-xapi-statements.js`](../workato/build-xapi-statements.js)
+(FNV-1a hash formatted as an RFC-4122-shaped UUID).
 
 Why this matters: per the xAPI spec, POSTing a statement whose `id` the LRS has
 already seen (with identical content) is a **no-op**. So if batch 7 of 20 fails
 and the job retries from the top, batches 1–6 don't double-write. It also makes
-the daily schedule naturally incremental — an unchanged user re-generates the
-same id and is ignored; a user whose state changed (new `LastCompletedActivity`
-or new verb) produces a new id and a new statement.
+the daily schedule naturally incremental — already-recorded events regenerate
+identical statements the LRS ignores; only genuinely new events land.
 
 > One statement id with *different* content returns `409 Conflict` — if you see
 > 409s, the id recipe above isn't including every field that can change.
@@ -296,8 +298,10 @@ answers `401 {"message":"invalid login"}`, the key/secret are swapped or the
 connection isn't Basic.
 
 1. Inside the plan loop after GetStatistics, add a **Repeat** over the user
-   array in **"Batch of items"** mode, **batch size 50**. Each iteration hands
-   you a list of ≤50 users instead of one.
+   array in **"Batch of items"** mode, **batch size 25**. Each iteration hands
+   you a list of ≤25 users instead of one. (25, not 50: with per-module
+   statements a batch can carry ~17 statements per user, and 25 keeps each
+   POST comfortably small.)
 2. Inside the loop, a **JavaScript by Workato** action builds the statement
    array — full code in
    [`workato/build-xapi-statements.js`](../workato/build-xapi-statements.js).
